@@ -1,0 +1,671 @@
+import os
+import sys
+import yaml
+import argparse
+from typing import Dict, List, Tuple, Any
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import torch
+from torch.utils.data import DataLoader
+from sklearn.metrics import roc_auc_score
+
+# Ensure root directory is on path
+sys.path.insert(0, os.path.abspath("."))
+
+from utils.logger import get_logger
+from utils.metrics import compute_binary_metrics, print_metrics_table
+from data.preprocessing import NBaIoTDataPreprocessor
+from data.download_nbaiot import get_nbaiot_feature_names, prepare_nbaiot_data
+from data.nbaiot_dataset import create_dataloaders, NBaIoTDataset
+from models.lstm import LSTMIDS
+from federated.client import IoTClient
+from federated.aggregation import (
+    compute_model_trust_weights,
+    compute_joint_trust_weights,
+    compute_temporal_trust_weights,
+    aggregate_models
+)
+from security.model_trust import (
+    ModelTrustEvaluator,
+    calculate_client_update
+)
+from security.explanation_trust import (
+    ExplanationTrustEvaluator,
+    get_shap_representation
+)
+from security.joint_trust import (
+    calculate_joint_trust,
+    compute_client_joint_trust
+)
+from security.temporal_trust import (
+    TemporalTrustManager,
+    update_temporal_trust,
+    calculate_final_trust
+)
+from security.attacks import (
+    BaseAttack,
+    NoAttack,
+    BackdoorAttack,
+    apply_backdoor_trigger,
+    poison_local_dataset,
+    compute_attack_success_rate,
+    select_malicious_clients,
+    create_attack
+)
+from xai.shap_explainer import SHAPExplainer
+
+logger = get_logger("StageG4_Backdoor")
+
+def load_config(config_path: str = "configs/config.yaml") -> dict:
+    with open(config_path, "r", encoding="utf-8") as f:
+        return yaml.safe_load(f)
+
+def create_lstm_model(model_config: dict, device: str = "cpu") -> LSTMIDS:
+    return LSTMIDS(
+        input_dim=model_config.get("input_dim", 115),
+        hidden_dim=model_config.get("hidden_dim", 64),
+        num_layers=model_config.get("num_layers", 2),
+        dense_dim=model_config.get("dense_dim", 32),
+        dropout=model_config.get("dropout", 0.2)
+    ).to(device)
+
+def evaluate_model_on_test_loader(
+    model: torch.nn.Module,
+    test_loader: DataLoader,
+    device: str = "cpu"
+) -> Dict[str, Any]:
+    """Evaluates a PyTorch model on test_loader and computes binary IDS metrics."""
+    dev = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
+    model = model.to(dev)
+    model.eval()
+    
+    all_preds = []
+    all_targets = []
+    
+    with torch.no_grad():
+        for x_b, y_b in test_loader:
+            x_b = x_b.to(dev)
+            probs = torch.sigmoid(model(x_b)).cpu().numpy().ravel()
+            all_preds.extend(probs)
+            all_targets.extend(y_b.numpy().ravel())
+            
+    return compute_binary_metrics(all_targets, all_preds)
+
+def compute_detection_metrics(
+    true_malicious_mask: List[int],
+    final_trust_scores: List[float],
+    threshold: float = 0.50
+) -> Dict[str, float]:
+    """
+    Evaluates malicious client detection where anomaly score = (1.0 - FinalTrust).
+    A client is flagged as malicious if FinalTrust <= threshold.
+    """
+    y_true = np.asarray(true_malicious_mask, dtype=int)
+    anomaly_scores = 1.0 - np.asarray(final_trust_scores, dtype=float)
+    y_pred = (anomaly_scores >= (1.0 - threshold)).astype(int)
+    
+    tp = int(np.sum((y_pred == 1) & (y_true == 1)))
+    fp = int(np.sum((y_pred == 1) & (y_true == 0)))
+    tn = int(np.sum((y_pred == 0) & (y_true == 0)))
+    fn = int(np.sum((y_pred == 0) & (y_true == 1)))
+    
+    prec = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    rec = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    f1 = float(2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
+    fpr = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+    
+    try:
+        if len(np.unique(y_true)) > 1:
+            auc = float(roc_auc_score(y_true, anomaly_scores))
+        else:
+            auc = 1.0 if tp > 0 else 0.5
+    except Exception:
+        auc = 0.5
+        
+    return {
+        "threshold": threshold,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "precision": prec,
+        "recall_detection_rate": rec,
+        "false_positive_rate": fpr,
+        "f1": f1,
+        "auc": auc
+    }
+
+def run_backdoor_benchmark(
+    config_path: str = "configs/config.yaml",
+    rounds: int = 3,
+    malicious_ratio: float = 0.10,
+    poison_ratio: float = 0.10,
+    target_label: int = 0,
+    trigger_features: List[int] = None,
+    trigger_val: float = 3.0,
+    start_round: int = 1,
+    seed: int = 42,
+    device: str = "cuda"
+):
+    output_dir = "results/attacks/backdoor"
+    os.makedirs(output_dir, exist_ok=True)
+    cfg = load_config(config_path)
+    
+    if trigger_features is None:
+        trigger_features = [105, 106, 107]
+        
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    feature_names = get_nbaiot_feature_names()
+    dev_type = device if torch.cuda.is_available() and device == "cuda" else "cpu"
+    
+    logger.info("=" * 115)
+    logger.info("   STAGE G4: SECURITY / ADVERSARIAL EVALUATION — BACKDOOR ATTACK")
+    logger.info(
+        f"   Attack: Backdoor | Poison Ratio: {poison_ratio:.2f} | Target: {target_label} "
+        f"| Trigger Features: {trigger_features} | Trigger Val: {trigger_val:.1f} "
+        f"| Ratio: {malicious_ratio:.2f} | Start Round: {start_round} | Seed: {seed}"
+    )
+    logger.info("=" * 115)
+    
+    # 1. Load Data
+    data_dir = cfg["dataset"]["data_dir"]
+    prepare_nbaiot_data(data_dir=data_dir, sample_size=cfg["dataset"].get("sample_size_per_client", 3000), seed=seed)
+    
+    preprocessor = NBaIoTDataPreprocessor(
+        data_dir=data_dir,
+        train_ratio=cfg["dataset"]["train_ratio"],
+        val_ratio=cfg["dataset"]["val_ratio"],
+        test_ratio=cfg["dataset"]["test_ratio"],
+        seed=seed
+    )
+    device_names = cfg["clients"]["device_names"]
+    num_clients = len(device_names)
+    client_data, (global_test_x, global_test_y) = preprocessor.load_and_preprocess_all(device_names)
+    
+    batch_size = cfg["federated"]["batch_size"]
+    global_test_dataset = NBaIoTDataset(global_test_x, global_test_y)
+    global_test_loader = DataLoader(global_test_dataset, batch_size=batch_size, shuffle=False)
+    
+    # Background and evaluation samples for SHAP
+    benign_idx = np.where(global_test_y == 0)[0][:40]
+    attack_idx = np.where(global_test_y == 1)[0][:20]
+    bg_samples = global_test_x[benign_idx]
+    eval_x_sample = np.vstack([global_test_x[benign_idx[:20]], global_test_x[attack_idx]])
+
+    # 2. Malicious Client Selection
+    malicious_device_names = select_malicious_clients(
+        total_clients=num_clients,
+        malicious_ratio=malicious_ratio,
+        seed=seed,
+        client_ids=device_names
+    )
+    logger.info(f"Selected Malicious Clients ({len(malicious_device_names)}/{num_clients}): {malicious_device_names}")
+    malicious_mask = [1 if dev in malicious_device_names else 0 for dev in device_names]
+    
+    # 3. Instantiate Attack
+    attack = BackdoorAttack(
+        malicious_client_ids=malicious_device_names,
+        poison_ratio=poison_ratio,
+        target_label=target_label,
+        trigger_features=trigger_features,
+        trigger_val=trigger_val,
+        start_round=start_round,
+        seed=seed
+    )
+
+    # 4. Client Pool Factory
+    def build_client_pool():
+        clients = []
+        for client_id, dev in enumerate(device_names):
+            splits = client_data[dev]
+            train_l, val_l, test_l = create_dataloaders(
+                splits["x_train"], splits["y_train"],
+                splits["x_val"], splits["y_val"],
+                splits["x_test"], splits["y_test"],
+                batch_size=batch_size
+            )
+            c = IoTClient(
+                client_id=client_id,
+                device_name=dev,
+                train_loader=train_l,
+                val_loader=val_l,
+                test_loader=test_l,
+                model_config=cfg["model"],
+                device=dev_type
+            )
+            clients.append(c)
+        return clients
+
+    initial_model = create_lstm_model(cfg["model"], device=dev_type)
+    initial_weights = {k: v.cpu().clone() for k, v in initial_model.state_dict().items()}
+    
+    clean_init_metrics = evaluate_model_on_test_loader(initial_model, global_test_loader, dev_type)
+    init_asr = compute_attack_success_rate(
+        model=initial_model,
+        x_test=global_test_x,
+        y_test=global_test_y,
+        trigger_features=trigger_features,
+        trigger_val=trigger_val,
+        target_label=target_label,
+        device=dev_type
+    )
+    logger.info(
+        f"Initial Untrained Model F1: {clean_init_metrics['f1'] * 100:.2f}% | "
+        f"Acc: {clean_init_metrics['accuracy'] * 100:.2f}% | ASR: {init_asr * 100:.2f}%"
+    )
+
+    # =========================================================================
+    # PHASE A: CLEAN BASELINE EXPERIMENT (0% Malicious Clients)
+    # =========================================================================
+    logger.info("\n>>> PHASE A: Running Clean Baseline Experiment (0% Malicious, FedAvg)...")
+    clean_clients = build_client_pool()
+    clean_server_model = create_lstm_model(cfg["model"], device=dev_type)
+    clean_server_model.load_state_dict(initial_weights)
+    
+    clean_round_metrics = []
+    for r in range(1, rounds + 1):
+        g_weights = {k: v.cpu().clone() for k, v in clean_server_model.state_dict().items()}
+        updates, counts = [], []
+        for client in clean_clients:
+            client.receive_global_weights(g_weights)
+            client.train_local(epochs=1, lr=cfg["federated"]["learning_rate"])
+            w_i, n_i = client.get_model_update()
+            updates.append(w_i)
+            counts.append(n_i)
+        agg_w, _ = aggregate_models(updates, counts, None, method="fedavg")
+        clean_server_model.load_state_dict(agg_w)
+        m = evaluate_model_on_test_loader(clean_server_model, global_test_loader, dev_type)
+        c_asr = compute_attack_success_rate(
+            model=clean_server_model,
+            x_test=global_test_x,
+            y_test=global_test_y,
+            trigger_features=trigger_features,
+            trigger_val=trigger_val,
+            target_label=target_label,
+            device=dev_type
+        )
+        m["round"] = r
+        m["asr"] = c_asr
+        clean_round_metrics.append(m)
+        logger.info(
+            f"Clean Round {r} FedAvg -> F1: {m['f1']*100:.2f}% | "
+            f"Acc: {m['accuracy']*100:.2f}% | FPR: {m['fpr']*100:.2f}% | Clean ASR: {c_asr*100:.2f}%"
+        )
+
+    final_clean_f1 = clean_round_metrics[-1]["f1"]
+    final_clean_acc = clean_round_metrics[-1]["accuracy"]
+    final_clean_asr = clean_round_metrics[-1]["asr"]
+
+    # =========================================================================
+    # PHASE B: ADVERSARIAL EVALUATION UNDER BACKDOOR ATTACK
+    # Comparing: FedAvg vs Model Trust vs Joint Trust vs Temporal Trust
+    # =========================================================================
+    logger.info("\n>>> PHASE B: Multi-Round Comparative Evaluation across 4 Aggregation Schemes...")
+    aggregation_schemes = ["fedavg", "model_trust", "joint_trust", "temporal_trust"]
+    
+    comparison_results = []
+    client_trajectories = []
+    detection_records = []
+
+    scheme_models = {
+        scheme: create_lstm_model(cfg["model"], device=dev_type) for scheme in aggregation_schemes
+    }
+    for sm in scheme_models.values():
+        sm.load_state_dict(initial_weights)
+        
+    scheme_temporal_managers = {
+        scheme: TemporalTrustManager(lambda_decay=0.70, beta=0.50) for scheme in aggregation_schemes
+    }
+
+    model_evaluator = ModelTrustEvaluator(w_direction=0.50, w_norm=0.20, w_layer=0.30, reference_strategy="leave_one_out")
+    expl_evaluator = ExplanationTrustEvaluator(w_similarity=0.40, w_jaccard=0.30, w_fidelity=0.30, top_k=5, reference_strategy="leave_one_out")
+    
+    clients = build_client_pool()
+
+    for r in range(1, rounds + 1):
+        print(f"\n" + "=" * 125)
+        print(f"   --- COMMUNICATION ROUND {r}/{rounds} UNDER BACKDOOR ATTACK (Poison Ratio={poison_ratio:.2f}) ---")
+        print("=" * 125)
+        
+        main_global_weights = {k: v.cpu().clone() for k, v in scheme_models["temporal_trust"].state_dict().items()}
+        
+        client_updates = {}
+        client_deltas = {}
+        sample_counts = []
+        client_models_dict = {}
+        client_eval_x_dict = {}
+
+        for i, client in enumerate(clients):
+            dev = client.device_name
+            client.receive_global_weights(main_global_weights)
+            
+            # Check if client is malicious and attack is active
+            if attack.is_active(r) and attack.is_malicious(dev):
+                # Apply data poisoning to local training split
+                orig_x_train = client_data[dev]["x_train"]
+                orig_y_train = client_data[dev]["y_train"]
+                
+                poison_x, poison_y = attack.apply_data_attack(
+                    x_data=orig_x_train,
+                    y_data=orig_y_train,
+                    client_id=dev,
+                    round_idx=r
+                )
+                
+                # Create custom poisoned training dataloader
+                p_dataset = NBaIoTDataset(poison_x, poison_y)
+                p_loader = DataLoader(p_dataset, batch_size=batch_size, shuffle=True)
+                
+                # Train local model with poisoned data
+                client.train_local(epochs=1, lr=cfg["federated"]["learning_rate"], custom_train_loader=p_loader)
+                logger.info(f"Client {i} ({dev}) trained on POISONED dataset ({poison_ratio*100:.0f}% backdoor triggers injected).")
+            else:
+                # Honest training on clean local dataset
+                client.train_local(epochs=1, lr=cfg["federated"]["learning_rate"])
+                
+            w_i, n_i = client.get_model_update()
+            sample_counts.append(n_i)
+            delta_i = calculate_client_update(main_global_weights, w_i)
+            
+            client_updates[dev] = w_i
+            client_deltas[dev] = delta_i
+            client_models_dict[dev] = client.model
+            client_eval_x_dict[dev] = eval_x_sample
+
+        # Trust Calculations
+        # 1. Model Trust (M_i)
+        m_scores, _ = model_evaluator.evaluate_all(client_deltas)
+        m_trust_list = [m_scores[c.device_name]["model_trust"] for c in clients]
+
+        # 2. Explanation Trust (E_i)
+        client_explanations = {}
+        for client in clients:
+            explainer = SHAPExplainer(model=client.model, background_data=bg_samples, feature_names=feature_names, device="cpu")
+            shap_vals = explainer.compute_shap_values(eval_x_sample)
+            client_explanations[client.device_name] = get_shap_representation(shap_vals)
+
+        e_scores, _ = expl_evaluator.evaluate_all(
+            client_explanations=client_explanations,
+            client_models=client_models_dict,
+            x_eval_dict=client_eval_x_dict,
+            feature_names=feature_names,
+            device=dev_type
+        )
+        e_trust_list = [e_scores[c.device_name]["explanation_trust"] for c in clients]
+
+        # 3. Joint Trust (T_i)
+        j_trust_dict = compute_client_joint_trust(m_scores, e_scores, alpha=0.50)
+        j_trust_list = [j_trust_dict[c.device_name] for c in clients]
+
+        # 4. Historical (H_i) and Final Trust (F_i)
+        h_trust_list = []
+        f_trust_list = []
+        for i, client in enumerate(clients):
+            rec = scheme_temporal_managers["temporal_trust"].update_client(
+                client_name=client.device_name,
+                joint_trust=j_trust_list[i],
+                round_idx=r,
+                model_trust=m_trust_list[i],
+                explanation_trust=e_trust_list[i]
+            )
+            h_trust_list.append(rec["historical_trust"])
+            f_trust_list.append(rec["final_trust"])
+
+        # Compute Weights for All 4 Methods
+        fedavg_w, model_w = compute_model_trust_weights(sample_counts, m_trust_list)
+        _, joint_w = compute_joint_trust_weights(sample_counts, j_trust_list)
+        _, final_w = compute_temporal_trust_weights(sample_counts, f_trust_list)
+
+        # Print Client Trust Table
+        header = f"{'ID':<2} | {'Device':<32} | {'Malicious?':<10} | {'Model M_i':<9} | {'Expl E_i':<9} | {'Joint T_i':<9} | {'Hist H_i':<9} | {'Final F_i':<9} | {'FedAvg W':<8} | {'Final W':<8}"
+        print(header)
+        print("-" * len(header))
+        for i, client in enumerate(clients):
+            is_m_str = "MALICIOUS" if client.device_name in malicious_device_names else "Honest"
+            print(
+                f"{i:<2} | {client.device_name:<32} | {is_m_str:<10} | "
+                f"{m_trust_list[i]:9.4f} | {e_trust_list[i]:9.4f} | {j_trust_list[i]:9.4f} | "
+                f"{h_trust_list[i]:9.4f} | {f_trust_list[i]:9.4f} | "
+                f"{fedavg_w[i]:8.4f} | {final_w[i]:8.4f}"
+            )
+            client_trajectories.append({
+                "round": r,
+                "client_id": i,
+                "device_name": client.device_name,
+                "malicious": 1 if client.device_name in malicious_device_names else 0,
+                "attack_type": "backdoor",
+                "poison_ratio": poison_ratio,
+                "target_label": target_label,
+                "attack_start_round": start_round,
+                "sample_count": sample_counts[i],
+                "model_trust": m_trust_list[i],
+                "explanation_trust": e_trust_list[i],
+                "joint_trust": j_trust_list[i],
+                "historical_trust": h_trust_list[i],
+                "final_trust": f_trust_list[i],
+                "fedavg_weight": fedavg_w[i],
+                "model_trust_weight": model_w[i],
+                "joint_trust_weight": joint_w[i],
+                "final_trust_weight": final_w[i]
+            })
+
+        # Malicious Client Detection Metrics
+        det = compute_detection_metrics(malicious_mask, f_trust_list, threshold=0.50)
+        det["round"] = r
+        det["poison_ratio"] = poison_ratio
+        detection_records.append(det)
+        logger.info(
+            f"Malicious Client Detection (Threshold 0.50): "
+            f"TP={det['tp']}, FP={det['fp']}, Precision={det['precision']*100:.1f}%, "
+            f"Recall={det['recall_detection_rate']*100:.1f}%, AUC={det['auc']:.4f}"
+        )
+
+        # Multi-Scheme Aggregation & Evaluation
+        updates_list = [client_updates[c.device_name] for c in clients]
+        scheme_weights_map = {
+            "fedavg": fedavg_w,
+            "model_trust": model_w,
+            "joint_trust": joint_w,
+            "temporal_trust": final_w
+        }
+
+        print(f"\n   >>> Performance Comparison across Aggregation Schemes (Round {r}):")
+        for scheme in aggregation_schemes:
+            if scheme == "fedavg":
+                agg_dict, _ = aggregate_models(updates_list, sample_counts, None, method="fedavg")
+            elif scheme == "model_trust":
+                agg_dict, _ = aggregate_models(updates_list, sample_counts, m_trust_list, method="model_trust")
+            elif scheme == "joint_trust":
+                agg_dict, _ = aggregate_models(updates_list, sample_counts, j_trust_list, method="joint_trust")
+            elif scheme == "temporal_trust":
+                agg_dict, _ = aggregate_models(updates_list, sample_counts, f_trust_list, method="temporal_trust")
+                
+            scheme_models[scheme].load_state_dict(agg_dict)
+            eval_metrics = evaluate_model_on_test_loader(scheme_models[scheme], global_test_loader, dev_type)
+            asr_score = compute_attack_success_rate(
+                model=scheme_models[scheme],
+                x_test=global_test_x,
+                y_test=global_test_y,
+                trigger_features=trigger_features,
+                trigger_val=trigger_val,
+                target_label=target_label,
+                device=dev_type
+            )
+            
+            mal_w_sum = sum([scheme_weights_map[scheme][idx] for idx, is_m in enumerate(malicious_mask) if is_m == 1])
+            hon_w_sum = sum([scheme_weights_map[scheme][idx] for idx, is_m in enumerate(malicious_mask) if is_m == 0])
+            
+            avg_mal_trust = float(np.mean([f_trust_list[idx] for idx, is_m in enumerate(malicious_mask) if is_m == 1])) if any(malicious_mask) else 0.0
+            avg_hon_trust = float(np.mean([f_trust_list[idx] for idx, is_m in enumerate(malicious_mask) if is_m == 0]))
+            
+            f1_degradation = max(0.0, final_clean_f1 - eval_metrics["f1"])
+            
+            comparison_results.append({
+                "round": r,
+                "aggregation_method": scheme,
+                "malicious_ratio": malicious_ratio,
+                "poison_ratio": poison_ratio,
+                "target_label": target_label,
+                "malicious_weight_sum": mal_w_sum,
+                "honest_weight_sum": hon_w_sum,
+                "avg_malicious_trust": avg_mal_trust,
+                "avg_honest_trust": avg_hon_trust,
+                "accuracy": eval_metrics["accuracy"],
+                "precision": eval_metrics["precision"],
+                "recall": eval_metrics["recall"],
+                "f1": eval_metrics["f1"],
+                "fpr": eval_metrics["fpr"],
+                "fnr": eval_metrics["fnr"],
+                "roc_auc": eval_metrics["roc_auc"],
+                "clean_f1_baseline": final_clean_f1,
+                "f1_degradation": f1_degradation,
+                "asr": asr_score,
+                "clean_asr_baseline": final_clean_asr
+            })
+            
+            print(
+                f"   * {scheme:<14} | F1: {eval_metrics['f1']*100:6.2f}% | "
+                f"Acc: {eval_metrics['accuracy']*100:6.2f}% | "
+                f"FPR: {eval_metrics['fpr']*100:6.2f}% | "
+                f"ASR: {asr_score*100:6.2f}% | "
+                f"Malicious Wt: {mal_w_sum*100:5.2f}% | "
+                f"F1 Drop: {f1_degradation*100:5.2f}%"
+            )
+
+    # 5. Save Structured CSV Results
+    df_traj = pd.DataFrame(client_trajectories)
+    traj_path = os.path.join(output_dir, "backdoor_client_trajectories.csv")
+    df_traj.to_csv(traj_path, index=False)
+    logger.info(f"Saved client trajectories to: {traj_path}")
+
+    df_comp = pd.DataFrame(comparison_results)
+    comp_path = os.path.join(output_dir, "backdoor_aggregation_comparison.csv")
+    df_comp.to_csv(comp_path, index=False)
+    logger.info(f"Saved aggregation comparisons to: {comp_path}")
+
+    df_det = pd.DataFrame(detection_records)
+    det_path = os.path.join(output_dir, "backdoor_detection_metrics.csv")
+    df_det.to_csv(det_path, index=False)
+    logger.info(f"Saved detection metrics to: {det_path}")
+
+    # 6. Generate 5-Panel Validation Plot
+    plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "default")
+    fig = plt.figure(figsize=(18, 12), dpi=300)
+    gs = fig.add_gridspec(2, 3)
+
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[0, 1])
+    ax3 = fig.add_subplot(gs[0, 2])
+    ax4 = fig.add_subplot(gs[1, 0:2])
+    ax5 = fig.add_subplot(gs[1, 2])
+
+    palette = {"fedavg": "#d9534f", "model_trust": "#f0ad4e", "joint_trust": "#5bc0de", "temporal_trust": "#2e7d32"}
+
+    # Panel 1: Global F1 vs Round
+    for scheme in aggregation_schemes:
+        sub = df_comp[df_comp["aggregation_method"] == scheme]
+        ax1.plot(sub["round"], sub["f1"] * 100, marker='o', linewidth=2.5, label=scheme.replace("_", " ").title(), color=palette.get(scheme))
+    ax1.axhline(final_clean_f1 * 100, color="#333333", linestyle="--", alpha=0.7, label=f"Clean Baseline ({final_clean_f1*100:.1f}%)")
+    ax1.set_title("1. Clean IDS F1-Score vs Round", fontsize=11, fontweight="bold")
+    ax1.set_xlabel("Communication Round", fontsize=9)
+    ax1.set_ylabel("Global F1-Score (%)", fontsize=9)
+    ax1.set_ylim(0, 105)
+    ax1.legend(loc="lower left", frameon=True, fontsize=8)
+
+    # Panel 2: Backdoor Attack Success Rate (ASR) vs Round
+    for scheme in aggregation_schemes:
+        sub = df_comp[df_comp["aggregation_method"] == scheme]
+        ax2.plot(sub["round"], sub["asr"] * 100, marker='s', linewidth=2.5, label=scheme.replace("_", " ").title(), color=palette.get(scheme))
+    ax2.axhline(final_clean_asr * 100, color="#333333", linestyle="--", alpha=0.7, label=f"Clean ASR ({final_clean_asr*100:.1f}%)")
+    ax2.set_title(f"2. Backdoor ASR (%) vs Round (Poison={poison_ratio*100:.0f}%)", fontsize=11, fontweight="bold")
+    ax2.set_xlabel("Communication Round", fontsize=9)
+    ax2.set_ylabel("Attack Success Rate (%)", fontsize=9)
+    ax2.set_ylim(0, 105)
+    ax2.legend(loc="upper left", frameon=True, fontsize=8)
+
+    # Panel 3: Malicious Client Final Trust vs Round
+    mal_traj = df_traj[df_traj["malicious"] == 1].groupby("round")["final_trust"].mean()
+    if not mal_traj.empty:
+        ax3.plot(mal_traj.index, mal_traj.values, marker='^', linewidth=2.5, color="#b71c1c", label=f"Malicious Trust (Poison={poison_ratio*100:.0f}%)")
+    ax3.axhline(0.50, color="gray", linestyle=":", label="Detection Threshold (0.50)")
+    ax3.set_title("3. Malicious Client Final Trust vs Round", fontsize=11, fontweight="bold")
+    ax3.set_xlabel("Communication Round", fontsize=9)
+    ax3.set_ylabel("Final Trust Score", fontsize=9)
+    ax3.set_ylim(0.0, 1.05)
+    ax3.legend(loc="lower left", frameon=True, fontsize=8)
+
+    # Panel 4: Honest vs Malicious Client Trust Trajectories
+    for i, client in enumerate(clients):
+        dev = client.device_name
+        sub_c = df_traj[df_traj["device_name"] == dev]
+        is_m = dev in malicious_device_names
+        color = "#b71c1c" if is_m else "#2e7d32"
+        style = "--" if is_m else "-"
+        width = 3.0 if is_m else 1.5
+        label = f"{dev} (MALICIOUS)" if is_m else (f"Honest Clients" if i == 0 else None)
+        ax4.plot(sub_c["round"], sub_c["final_trust"], linestyle=style, linewidth=width, color=color, marker='o' if is_m else None, label=label)
+    ax4.axhline(0.50, color="gray", linestyle=":", alpha=0.7, label="Detection Threshold (0.50)")
+    ax4.set_title("4. Client Final Trust Trajectories (Honest vs Malicious)", fontsize=11, fontweight="bold")
+    ax4.set_xlabel("Communication Round", fontsize=9)
+    ax4.set_ylabel("Final Trust Score", fontsize=9)
+    ax4.set_ylim(0.0, 1.05)
+    ax4.legend(loc="lower left", frameon=True, fontsize=8)
+
+    # Panel 5: Malicious Weight Sum vs Round across Aggregation Schemes
+    for scheme in aggregation_schemes:
+        sub = df_comp[df_comp["aggregation_method"] == scheme]
+        ax5.plot(sub["round"], sub["malicious_weight_sum"] * 100, marker='d', linewidth=2.5, label=scheme.replace("_", " ").title(), color=palette.get(scheme))
+    ax5.axhline(100.0 / num_clients, color="gray", linestyle="--", alpha=0.7, label=f"FedAvg Equal Weight ({100.0/num_clients:.1f}%)")
+    ax5.set_title("5. Malicious Client Weight Sum (%) vs Round", fontsize=11, fontweight="bold")
+    ax5.set_xlabel("Communication Round", fontsize=9)
+    ax5.set_ylabel("Aggregated Weight (%)", fontsize=9)
+    ax5.set_ylim(0, 30)
+    ax5.legend(loc="upper right", frameon=True, fontsize=8)
+
+    plt.suptitle("Stage G4: Backdoor Attack Defense Benchmark — FedXAI Trust Pipeline", fontsize=15, fontweight="bold", y=0.98)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    
+    fig_path = os.path.join(output_dir, "stage_g4_backdoor_validation.png")
+    plt.savefig(fig_path, dpi=300, bbox_inches="tight")
+    plt.close()
+    logger.info(f"Saved 5-panel validation figure to: {fig_path}")
+
+    # Copy figure to artifacts directory if available
+    artifact_dir = os.path.abspath("C:/Users/mg631/.gemini/antigravity-ide/brain/2fc60168-5d84-4e19-92ec-ec184bfb8405")
+    if os.path.isdir(artifact_dir):
+        dest_path = os.path.join(artifact_dir, "stage_g4_backdoor_validation.png")
+        try:
+            import shutil
+            shutil.copyfile(fig_path, dest_path)
+            logger.info(f"Copied validation figure to artifact directory: {dest_path}")
+        except Exception as e:
+            logger.warning(f"Could not copy figure to artifact directory: {e}")
+
+    logger.info("\n" + "=" * 115)
+    logger.info("   STAGE G4: BACKDOOR ATTACK BENCHMARK COMPLETED SUCCESSFULLY")
+    logger.info("=" * 115)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Stage G4 Backdoor Attack Benchmark")
+    parser.add_argument("--config", type=str, default="configs/config.yaml", help="Path to configuration file")
+    parser.add_argument("--rounds", type=int, default=3, help="Number of communication rounds")
+    parser.add_argument("--malicious_ratio", type=float, default=0.10, help="Ratio of malicious clients")
+    parser.add_argument("--poison_ratio", type=float, default=0.10, help="Fraction of local training samples poisoned")
+    parser.add_argument("--target_label", type=int, default=0, help="Target backdoor label (0: Evasion)")
+    parser.add_argument("--trigger_val", type=float, default=3.0, help="Trigger injection watermark value")
+    parser.add_argument("--start_round", type=int, default=1, help="Round when backdoor attack activates")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--device", type=str, default="cuda", help="Computation device (cuda or cpu)")
+    args = parser.parse_args()
+
+    run_backdoor_benchmark(
+        config_path=args.config,
+        rounds=args.rounds,
+        malicious_ratio=args.malicious_ratio,
+        poison_ratio=args.poison_ratio,
+        target_label=args.target_label,
+        trigger_val=args.trigger_val,
+        start_round=args.start_round,
+        seed=args.seed,
+        device=args.device
+    )
